@@ -3,6 +3,7 @@
 #include "logging.h"
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 #include <map>
 #include <sstream>
 #include <vector>
@@ -109,7 +110,7 @@ IScaleLayer* addBatchNorm(INetworkDefinition *network, std::map<std::string, Wei
     return scale_1;
 }
 
-ILayer* hSwish(INetworkDefinition *network, ITensor& input, std::string name) {
+ILayer* hSwish(INetworkDefinition *network, ITensor& input) {
     auto hsig = network->addActivation(input, ActivationType::kHARD_SIGMOID);
     assert(hsig);
     hsig->setAlpha(1.0 / 6.0);
@@ -119,118 +120,89 @@ ILayer* hSwish(INetworkDefinition *network, ITensor& input, std::string name) {
     return hsw;
 }
 
-ILayer* convBnHswish(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input,  int outch, int ksize, int s, int g, std::string lname) {
+int makeDivisible(v, divisor, min_value=NULL) {
+    if(min_value == NULL) {
+        min_value = divisor;
+    }
+
+    new_v = std::max(min_value, int((v + divisor) / 2) / (divisor * divisor));
+    if(new_v < (0.9*v)){
+        new_v += divisor;
+    }
+
+    return new_v;
+}
+
+
+ILayer* seLayer(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int inch, int squeezeFactor, std::string lname) {
+    Weights emptywts{DataType::kFLOAT, nullptr, 0};
+    int outch = makeDivisible((inch / squeezeFactor), 8);
+    IConvolutionLayer* conv1 = network->addConvolutionNd(input, outch, DimsHW{1, 1}, weightMap[lname + "fc1.weight"], emptywts);
+    assert(conv1);
+    conv1->setStrideNd(DimsHW{1, 1});
+
+    IActivationLayer* relu1 = network->addActivation(*conv1->getOutput(0), ActivationType::kRELU);
+    assert(relu1);
+
+    IConvolutionLayer* conv2 = network->addConvolutionNd(*relu1->getOutput(0), inch, DimsHW{1, 1}, weightMap[lname + "fc2.weight"], emptywts);
+    assert(conv2);
+    conv1->setStrideNd(DimsHW{1, 1});
+
+    return conv2;
+}
+
+ILayer* convBnActivation(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int outch, int ksize, int s, int g, bool use_hs, bool use_identity, std::string lname) {
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
     int p = (ksize - 1) / 2;
     IConvolutionLayer* conv1 = network->addConvolutionNd(input, outch, DimsHW{ksize, ksize}, weightMap[lname + "0.weight"], emptywts);
     assert(conv1);
     conv1->setStrideNd(DimsHW{s, s});
     conv1->setPaddingNd(DimsHW{p, p});
-    conv1->setNbGroups(g);
+    if (g > 0)
+        conv1->setNbGroups(g);
 
     IScaleLayer* bn1 = addBatchNorm(network, weightMap, *conv1->getOutput(0), lname + "1", 1e-5);
-    ILayer* hsw = hSwish(network, *bn1->getOutput(0), lname+"2");
-    assert(hsw);
-    return hsw;
+
+    if (use_identity) {
+        auto final = bn1;
+        return final:
+    }
+
+    if (use_hs)
+        auto final = hSwish(network, *bn1->getOutput(0), lname+"2");
+    else (use_relu) 
+        auto final = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
+    
+    return final;
 }
 
-ILayer* seLayer(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int c, int w, std::string lname) {
-    int h = w;
-    IPoolingLayer* l1 = network->addPoolingNd(input, PoolingType::kAVERAGE, DimsHW(w, h));
-    assert(l1);
-    l1->setStrideNd(DimsHW{w, h});
-    IFullyConnectedLayer* l2 = network->addFullyConnected(*l1->getOutput(0), BS*c/4, weightMap[lname+"fc.0.weight"], weightMap[lname+"fc.0.bias"]);
-    IActivationLayer* relu1 = network->addActivation(*l2->getOutput(0), ActivationType::kRELU);
-    IFullyConnectedLayer* l4 = network->addFullyConnected(*relu1->getOutput(0), BS*c, weightMap[lname+"fc.2.weight"], weightMap[lname+"fc.2.bias"]);
-
-    auto hsig = network->addActivation(*l4->getOutput(0), ActivationType::kHARD_SIGMOID);
-    assert(hsig);
-    hsig->setAlpha(1.0 / 6.0);
-    hsig->setBeta(0.5);
-
-    ILayer* se = network->addElementWise(input, *hsig->getOutput(0), ElementWiseOperation::kPROD);
-    assert(se);
-    return se;
-}
-
-ILayer* convSeq1(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int output, int hdim, int k, int s, bool use_se, bool use_hs, int w, std::string lname) {
+ILayer* convSeq1(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int outch, int hdim, int k, int s, bool use_hs, std::string lname) {
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
-    int p = (k - 1) / 2;
-    IConvolutionLayer* conv1 = network->addConvolutionNd(input, hdim, DimsHW{k, k}, weightMap[lname + "0.weight"], emptywts);
-    conv1->setStrideNd(DimsHW{s, s});
-    conv1->setPaddingNd(DimsHW{p, p});
-    conv1->setNbGroups(hdim);
-
-    IScaleLayer* bn1 = addBatchNorm(network, weightMap, *conv1->getOutput(0), lname + "1", 1e-5);
-    ITensor *tensor3, *tensor4;
-    tensor3 = nullptr;
-    tensor4 = nullptr;
-    if (use_hs) {
-        ILayer* hsw = hSwish(network, *bn1->getOutput(0), lname+"2");
-        tensor3 = hsw->getOutput(0);
-    } else {
-        IActivationLayer* relu1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
-        tensor3 = relu1->getOutput(0);
-    }
-    if (use_se) {
-         ILayer* se1 = seLayer(network, weightMap, *tensor3, hdim, w, lname + "3.");
-         tensor4 = se1->getOutput(0);
-    } else {
-         tensor4 = tensor3;
-    }
-    IConvolutionLayer* conv2 = network->addConvolutionNd(*tensor4, output, DimsHW{1, 1}, weightMap[lname + "4.weight"], emptywts);
-    IScaleLayer* bn2 = addBatchNorm(network, weightMap, *conv2->getOutput(0), lname + "5", 1e-5);
-    assert(bn2);
-    return bn2;
+    auto conv1 = convBnActivation(network, weightMap, input, outch, k, s, hdim, use_hs, false, "0.")
+    auto conv2 = seLayer(network, weightMap, *conv1->getOutput(0), outch, outch, "1.")
+    auto conv3 = convBnActivation(network, weightMap, *conv2->getOutput(0), outch, 1, 1, 0, use_hs, true, "2.");
+    return conv3;
 }
 
-ILayer* convSeq2(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int output, int hdim, int k, int s, bool use_se, bool use_hs, int w, std::string lname) {
+ILayer* convSeq2(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int outch, int hdim, int k, int s, bool use_se, bool use_hs, std::string lname) {
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
-    int p = (k - 1) / 2;
-    IConvolutionLayer* conv1 = network->addConvolutionNd(input, hdim, DimsHW{1, 1}, weightMap[lname + "0.weight"], emptywts);
-    IScaleLayer* bn1 = addBatchNorm(network, weightMap, *conv1->getOutput(0), lname + "1", 1e-5);
-    ITensor *tensor3, *tensor6, *tensor7;
-    tensor3 = nullptr;
-    tensor6 = nullptr;
-    tensor7 = nullptr;
-    if (use_hs) {
-        ILayer* hsw1 = hSwish(network, *bn1->getOutput(0), lname + "2");
-        tensor3 = hsw1->getOutput(0);
-    } else {
-        IActivationLayer* relu1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
-        tensor3 = relu1->getOutput(0);
-    }
-    IConvolutionLayer* conv2 = network->addConvolutionNd(*tensor3, hdim, DimsHW{k, k}, weightMap[lname + "3.weight"], emptywts);
-    conv2->setStrideNd(DimsHW{s, s});
-    conv2->setPaddingNd(DimsHW{p, p});
-    conv2->setNbGroups(hdim);
-    IScaleLayer* bn2 = addBatchNorm(network, weightMap, *conv2->getOutput(0), lname + "4", 1e-5);
+    auto conv1 = convBnActivation(network, weightMap, input, hdim, 1, 1, 0, use_hs, false, "0.");
+    auto conv2 = convBnActivation(network, weightMap, *conv1->getOutput(0), hdim, k, s, hdim, use_hs, false, "1.");
+
     if (use_se) {
-         ILayer* se1 = seLayer(network, weightMap, *bn2->getOutput(0), hdim, w, lname + "5.");
-         tensor6 = se1->getOutput(0);
-    } else {
-         tensor6 = bn2->getOutput(0);
+        auto conv2 = seLayer(network, weightMap, *conv2->getOutput(0), hdim, hdim, "2.")
     }
-    if (use_hs) {
-        ILayer* hsw2 = hSwish(network, *tensor6, lname + "6");
-        tensor7 = hsw2->getOutput(0);
-    } else {
-        IActivationLayer* relu2 = network->addActivation(*tensor6, ActivationType::kRELU);
-        tensor7 = relu2->getOutput(0);
-    }
-    IConvolutionLayer* conv3 = network->addConvolutionNd(*tensor7, output, DimsHW{1, 1}, weightMap[lname + "7.weight"], emptywts);
-    IScaleLayer* bn3 = addBatchNorm(network, weightMap, *conv3->getOutput(0), lname + "8", 1e-5);
-    assert(bn3);
-    return bn3;
+    auto conv3 = convBnActivation(network, weightMap, *conv2->getOutput(0), outch, 1, 1, 0, use_hs, true, "2.");
+    return conv3;
 }
 
-ILayer* invertedRes(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, std::string lname, int inch, int outch, int s, int hidden, int k, bool use_se, bool use_hs, int w) {
+ILayer* invertedRes(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, std::string lname, int inch, int outch, int s, int hidden, int k, bool use_se, bool use_hs) {
     bool use_res_connect = (s == 1 && inch == outch);
     ILayer *conv = nullptr;
     if (inch == hidden) {
-        conv = convSeq1(network, weightMap, input, outch, hidden, k, s, use_se, use_hs, w, lname + "conv.");
+        conv = convSeq1(network, weightMap, input, outch, hidden, k, s, use_hs, lname + "block.");
     } else {
-        conv = convSeq2(network, weightMap, input, outch, hidden, k, s, use_se, use_hs, w, lname + "conv.");
+        conv = convSeq2(network, weightMap, input, outch, hidden, k, s, use_se, use_hs, lname + "block.");
     }
 
     if (!use_res_connect) return conv;
@@ -239,7 +211,7 @@ ILayer* invertedRes(INetworkDefinition *network, std::map<std::string, Weights>&
     return ew3;
 }
 
-// Creat the engine using only the API and not any parser.
+// Create the engine using only the API and not any parser.
 ICudaEngine* createEngineSmall(unsigned int maxBatchSize, IBuilder* builder, IBuilderConfig* config, DataType dt)
 {
     INetworkDefinition* network = builder->createNetworkV2(0U);
@@ -247,41 +219,36 @@ ICudaEngine* createEngineSmall(unsigned int maxBatchSize, IBuilder* builder, IBu
     ITensor* data = network->addInput(INPUT_BLOB_NAME, dt, Dims3{3, INPUT_H, INPUT_W});
     assert(data);
 
-    std::map<std::string, Weights> weightMap = loadWeights("../mbv3_small.wts");
+    std::map<std::string, Weights> weightMap = loadWeights("../mobilenetv3_small.wts");
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
 
     //auto test1 = network->addActivation(*data, ActivationType::kRELU);
-    auto ew1 = convBnHswish(network, weightMap, *data, 16, 3, 2, 1, "features.0.");
-    auto ir1 = invertedRes(network, weightMap, *ew1->getOutput(0), "features.1.", 16, 16, 2, 16, 3, 1, 0, 56);
-    auto ir2 = invertedRes(network, weightMap, *ir1->getOutput(0), "features.2.", 16, 24, 2, 72, 3, 0, 0, 28);
-    auto ir3 = invertedRes(network, weightMap, *ir2->getOutput(0), "features.3.", 24, 24, 1, 88, 3, 0, 0, 28);
-    auto ir4 = invertedRes(network, weightMap, *ir3->getOutput(0), "features.4.", 24, 40, 2, 96, 5, 1, 1, 14);
-    auto ir5 = invertedRes(network, weightMap, *ir4->getOutput(0), "features.5.", 40, 40, 1, 240, 5, 1, 1, 14);
-    auto ir6 = invertedRes(network, weightMap, *ir5->getOutput(0), "features.6.", 40, 40, 1, 240, 5, 1, 1, 14);
-    auto ir7 = invertedRes(network, weightMap, *ir6->getOutput(0), "features.7.", 40, 48, 1, 120, 5, 1, 1, 14);
-    auto ir8 = invertedRes(network, weightMap, *ir7->getOutput(0), "features.8.", 48, 48, 1, 144, 5, 1, 1, 14);
-    auto ir9 = invertedRes(network, weightMap, *ir8->getOutput(0), "features.9.", 48, 96, 2, 288, 5, 1, 1, 7);
-    auto ir10 = invertedRes(network, weightMap, *ir9->getOutput(0), "features.10.", 96, 96, 1, 576, 5, 1, 1, 7);
-    auto ir11 = invertedRes(network, weightMap, *ir10->getOutput(0), "features.11.", 96, 96, 1, 576, 5, 1, 1, 7);
-    ILayer* ew2 = convBnHswish(network, weightMap, *ir11->getOutput(0), 576, 1, 1, 1, "conv.0.");
-    ILayer* se1 = seLayer(network, weightMap, *ew2->getOutput(0), 576, 7, "conv.1.");
+    auto ew1 = convBnActivation(network, weightMap, *data, 16, 3, 2, 0, true, false, "features.0.");
+    auto ir1 = invertedRes(network, weightMap, *ew1->getOutput(0), "features.1.", 16, 16, 2, 16, 3, true, false);
+    auto ir2 = invertedRes(network, weightMap, *ir1->getOutput(0), "features.2.", 16, 24, 2, 72, 3, false, false);
+    auto ir3 = invertedRes(network, weightMap, *ir2->getOutput(0), "features.3.", 24, 24, 1, 88, 3, false, false);
+    auto ir4 = invertedRes(network, weightMap, *ir3->getOutput(0), "features.4.", 24, 40, 2, 96, 5, true, true);
+    auto ir5 = invertedRes(network, weightMap, *ir4->getOutput(0), "features.5.", 40, 40, 1, 240, 5, true, true);
+    auto ir6 = invertedRes(network, weightMap, *ir5->getOutput(0), "features.6.", 40, 40, 1, 240, 5, true, true);
+    auto ir7 = invertedRes(network, weightMap, *ir6->getOutput(0), "features.7.", 40, 48, 1, 120, 5, true, true);
+    auto ir8 = invertedRes(network, weightMap, *ir7->getOutput(0), "features.8.", 48, 48, 1, 144, 5, true, true);
+    auto ir9 = invertedRes(network, weightMap, *ir8->getOutput(0), "features.9.", 48, 96, 2, 288, 5, true, true);
+    auto ir10 = invertedRes(network, weightMap, *ir9->getOutput(0), "features.10.", 96, 96, 1, 576, 5, true, true);
+    auto ir11 = invertedRes(network, weightMap, *ir10->getOutput(0), "features.11.", 96, 96, 1, 576, 5, true, true);
+    ILayer* ew2 = convBnActivation(network, weightMap, *ir11->getOutput(0), 576, 1, 1, 0, true, false, "features.12.");
 
-    IPoolingLayer* pool1 = network->addPoolingNd(*se1->getOutput(0), PoolingType::kAVERAGE, DimsHW{7, 7});
+    IPoolingLayer* pool1 = network->addPoolingNd(*ew2->getOutput(0), PoolingType::kAVERAGE, DimsHW{7, 7});
     assert(pool1);
     pool1->setStrideNd(DimsHW{7, 7});
-    ILayer* sw1 = hSwish(network, *pool1->getOutput(0), "hSwish.0");
 
-    IFullyConnectedLayer* fc1 = network->addFullyConnected(*sw1->getOutput(0), 1280, weightMap["classifier.0.weight"], weightMap["classifier.0.bias"]);
+    IFullyConnectedLayer* fc1 = network->addFullyConnected(*pool1->getOutput(0), 1024, weightMap["classifier.0.weight"], weightMap["classifier.0.bias"]);
     assert(fc1);
-    ILayer* bn1 = addBatchNorm(network, weightMap, *fc1->getOutput(0), "classifier.1", 1e-5);
-    ILayer* sw2 = hSwish(network, *bn1->getOutput(0), "hSwish.1");
+    ILayer* sw2 = hSwish(network, *fc1->getOutput(0));
     IFullyConnectedLayer* fc2 = network->addFullyConnected(*sw2->getOutput(0), 1000, weightMap["classifier.3.weight"], weightMap["classifier.3.bias"]);
-    ILayer* bn2 = addBatchNorm(network, weightMap, *fc2->getOutput(0), "classifier.4", 1e-5);
-    ILayer* sw3 = hSwish(network, *bn2->getOutput(0), "hSwish.2");
 
-    sw3->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    fc2->getOutput(0)->setName(OUTPUT_BLOB_NAME);
     std::cout << "set name out" << std::endl;
-    network->markOutput(*sw3->getOutput(0));
+    network->markOutput(*fc2->getOutput(0));
 
     // Build engine
     builder->setMaxBatchSize(maxBatchSize);
